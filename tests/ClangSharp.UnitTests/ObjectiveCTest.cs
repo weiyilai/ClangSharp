@@ -2,6 +2,7 @@
 
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
 using ClangSharp.Interop;
 using NUnit.Framework;
@@ -763,5 +764,474 @@ __attribute__((availability(ios,introduced=10.0)))
         Assert.That(property_retain_readonly_class.GetPropertyAttributes(), Is.EqualTo(ObjCPropertyAttributeKind.Retain | ObjCPropertyAttributeKind.ReadOnly | ObjCPropertyAttributeKind.Atomic | ObjCPropertyAttributeKind.Class), "property_retain_readonly_class GetPropertyAttributes()");
 
         Assert.That(properties, Is.Empty, "All properties processed");
+    }
+
+    [Test]
+    public void Type_AttributedType_WithMismatchedCXTypeKind()
+    {
+        // Regression test: libclang may return a CXTypeKind (e.g. CXType_ObjCId) that
+        // differs from what ClangSharp expects for a given CX_TypeClass (e.g. CX_TypeClass_Attributed
+        // expects CXType_Attributed). This should not crash — TypeClass is the authoritative
+        // classifier from libClangSharp and should be trusted when CXTypeKind is coarser.
+        //
+        // This pattern occurs with nullable/attributed ObjC pointer types in system framework
+        // headers. The bug manifests with the iOS SDK where id types are attributed.
+
+        var tmpDir = Path.Combine(Path.GetTempPath(), "clangsharp-test-" + Guid.NewGuid().ToString("N")[..8]);
+        _ = Directory.CreateDirectory(tmpDir);
+        var tmpFile = Path.Combine(tmpDir, "test.m");
+        try
+        {
+            File.WriteAllText(tmpFile, """
+#import <Foundation/Foundation.h>
+
+@interface TestClass : NSObject
+    // nullable id creates an AttributedType where libclang returns CXType_ObjCId
+    // but libClangSharp classifies it as CX_TypeClass_Attributed
+    -(void) doSomethingWith:(nullable id)value;
+    @property (nullable, nonatomic, strong) NSObject *obj;
+@end
+""");
+
+            using var translationUnit = CreateFoundationTranslationUnit(tmpFile, ["iphoneos", "macosx"]);
+            if (translationUnit is null)
+            {
+                Assert.Ignore("No SDK with Foundation available — skipping test");
+                return;
+            }
+
+            // Deep traversal of all declarations and their types — this is where the crash occurred.
+            // PointerType.PointeeType would create an AttributedType with CXType_ObjCId,
+            // and the Type constructor would throw ArgumentOutOfRangeException("handle").
+            foreach (var decl in translationUnit.TranslationUnitDecl.Decls)
+            {
+                if (decl is ObjCContainerDecl containerDecl)
+                {
+                    foreach (var childDecl in containerDecl.Decls)
+                    {
+                        if (childDecl is ObjCMethodDecl methodDecl)
+                        {
+                            // Accessing ReturnType and parameter Types triggers type creation
+                            _ = methodDecl.ReturnType;
+                            foreach (var param in methodDecl.Parameters)
+                            {
+                                var paramType = param.Type;
+                                // Walk the type chain to trigger PointeeType access
+                                if (paramType is PointerType pointerType)
+                                {
+                                    _ = pointerType.PointeeType;
+                                }
+                                else if (paramType is AttributedType attributedType)
+                                {
+                                    _ = attributedType.ModifiedType;
+                                    _ = attributedType.EquivalentType;
+                                }
+                            }
+                        }
+
+                        if (childDecl is ObjCPropertyDecl propertyDecl)
+                        {
+                            var propType = propertyDecl.Type;
+                            if (propType is AttributedType attributedType)
+                            {
+                                _ = attributedType.ModifiedType;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Verify we found our test class
+            var classes = translationUnit.TranslationUnitDecl.Decls.OfType<ObjCInterfaceDecl>().ToList();
+            Assert.That(classes.Any(v => v.Name == "TestClass"), Is.True, "TestClass should be found");
+        }
+        finally
+        {
+            Directory.Delete(tmpDir, true);
+        }
+    }
+
+    [Test]
+    public void Type_FullFoundationTraversal_DoesNotCrash()
+    {
+        // Regression test: traversing ALL declarations from a translation unit that
+        // includes <Foundation/Foundation.h> should not throw ArgumentOutOfRangeException.
+        // This is the exact scenario that crashed before the fix.
+        // The bug manifests with the iOS SDK where attributed types have CXType_ObjCId
+        // instead of CXType_Attributed.
+
+        var tmpDir = Path.Combine(Path.GetTempPath(), "clangsharp-test-" + Guid.NewGuid().ToString("N")[..8]);
+        _ = Directory.CreateDirectory(tmpDir);
+        var tmpFile = Path.Combine(tmpDir, "test.m");
+        try
+        {
+            File.WriteAllText(tmpFile, """
+#import <Foundation/Foundation.h>
+@interface MyClass : NSObject
+@property int val;
+@end
+""");
+
+            using var translationUnit = CreateFoundationTranslationUnit(tmpFile, ["iphoneos", "macosx"]);
+            if (translationUnit is null)
+            {
+                Assert.Ignore("No SDK with Foundation available — skipping test");
+                return;
+            }
+
+            // Full recursive traversal — this crashed with ArgumentOutOfRangeException("handle")
+            // because AttributedType constructor rejected CXType_ObjCId as a valid kind.
+            // The crash path was: RecordDecl → FieldDecl → Type.PointeeType → AttributedType
+            var topLevelCount = 0;
+            var childCount = 0;
+            foreach (var decl in translationUnit.TranslationUnitDecl.Decls)
+            {
+                topLevelCount++;
+
+                // Visit ALL container types (ObjC interfaces, protocols, categories)
+                if (decl is ObjCContainerDecl containerDecl)
+                {
+                    foreach (var childDecl in containerDecl.Decls)
+                    {
+                        childCount++;
+                        VisitDeclTypes(childDecl);
+                    }
+                }
+
+                // Visit RecordDecls (C structs) — this is the actual crash path.
+                // Foundation headers contain structs with fields that have attributed
+                // pointer types (e.g. nullable id), and accessing FieldDecl.Type.PointeeType
+                // triggers the AttributedType constructor with mismatched CXTypeKind.
+                if (decl is RecordDecl recordDecl)
+                {
+                    foreach (var field in recordDecl.Decls)
+                    {
+                        childCount++;
+                        VisitDeclTypes(field);
+                    }
+                }
+            }
+
+            // Foundation should have thousands of declarations
+            Assert.That(topLevelCount, Is.GreaterThan(100), "Should have many top-level declarations from Foundation");
+            Assert.That(childCount, Is.GreaterThan(100), "Should have many child declarations");
+        }
+        finally
+        {
+            Directory.Delete(tmpDir, true);
+        }
+    }
+
+    [Test]
+    public void Type_DeepTraversal_DoesNotCrash()
+    {
+        // Regression test: traversing all declarations in an ObjC translation unit
+        // and accessing their child declarations, method return types, parameter types,
+        // and property types should not throw ArgumentOutOfRangeException("handle").
+        //
+        // This covers the scenario where a large number of ObjC declarations are parsed
+        // and the binding generator needs to recursively visit all type information.
+        var inputContents = """
+@class NSObject;
+@class NSString;
+@class NSArray;
+@class NSError;
+
+@protocol Proto1
+    @required
+    -(void) requiredMethod;
+    @optional
+    -(void) optionalMethod;
+    @property (nullable) NSString *optionalProp;
+@end
+
+@protocol Proto2 <Proto1>
+    -(NSString*) stringMethod:(NSArray*)array error:(NSError**)error;
+@end
+
+@interface Base
+    @property int baseValue;
+@end
+
+@interface Child : Base <Proto2>
+    @property (nonatomic, copy) NSString *name;
+    @property (nullable, nonatomic, strong) NSArray *items;
+    -(instancetype) initWithName:(NSString *)name;
+    -(void) doSomething:(nullable id)param;
+    +(Child*) sharedInstance;
+@end
+
+@interface Child (Category)
+    -(void) categoryMethod;
+    @property (readonly) int categoryProp;
+@end
+""";
+        using var translationUnit = CreateTranslationUnit(inputContents, "objective-c++");
+
+        // Deep traversal: access all declarations, their children, and all types.
+        // This should complete without any ArgumentOutOfRangeException.
+        foreach (var decl in translationUnit.TranslationUnitDecl.Decls)
+        {
+            // Access cursor properties
+            _ = decl.CursorKindSpelling;
+
+            if (decl is NamedDecl namedDecl)
+            {
+                _ = namedDecl.Name;
+            }
+
+            // Recurse into containers
+            if (decl is ObjCContainerDecl containerDecl)
+            {
+                foreach (var childDecl in containerDecl.Decls)
+                {
+                    _ = childDecl.CursorKindSpelling;
+
+                    if (childDecl is ObjCMethodDecl methodDecl)
+                    {
+                        _ = methodDecl.ReturnType;
+                        foreach (var param in methodDecl.Parameters)
+                        {
+                            _ = param.Type;
+                            _ = param.Name;
+                        }
+                    }
+
+                    if (childDecl is ObjCPropertyDecl propertyDecl)
+                    {
+                        _ = propertyDecl.Type;
+                        _ = propertyDecl.Name;
+                    }
+                }
+            }
+        }
+
+        // If we get here without throwing, the test passes
+        var classes = translationUnit.TranslationUnitDecl.Decls.OfType<ObjCInterfaceDecl>().ToList();
+        Assert.That(classes.Count, Is.GreaterThanOrEqualTo(2), "Should have at least Base and Child classes");
+    }
+
+    [Test]
+    public void Decl_InvalidDeclKind_DoesNotCrash()
+    {
+        // Regression test: when libClangSharp returns CX_DeclKind_Invalid for a cursor
+        // that libclang considers a valid declaration, Decl.Create() should create a
+        // generic Decl wrapper instead of throwing ArgumentOutOfRangeException.
+        //
+        // This is tested indirectly by ensuring that complex ObjC code with diverse
+        // declaration kinds can be fully traversed without crashes.
+        var inputContents = """
+@class NSObject;
+
+@protocol DelegateProtocol
+    @required
+    -(void) didFinish;
+    @optional
+    -(void) didFail;
+@end
+
+@interface Manager
+    @property (weak) id<DelegateProtocol> delegate;
+    -(void) start;
+@end
+
+// Categories add diverse declaration kinds to the AST
+@interface Manager (Extensions)
+    -(void) reset;
+@end
+
+@interface Manager (MoreExtensions)
+    @property (readonly) int state;
+@end
+""";
+        using var translationUnit = CreateTranslationUnit(inputContents, "objective-c++");
+
+        // Walk the entire AST including child decls — this exercises Decl.Create()
+        // for diverse declaration kinds
+        var declCount = 0;
+        foreach (var decl in translationUnit.TranslationUnitDecl.Decls)
+        {
+            declCount++;
+            foreach (var child in decl.CursorChildren)
+            {
+                _ = child.CursorKindSpelling;
+            }
+        }
+
+        Assert.That(declCount, Is.GreaterThan(0), "Should have declarations");
+
+        var classes = translationUnit.TranslationUnitDecl.Decls.OfType<ObjCInterfaceDecl>().ToList();
+        Assert.That(classes.Any(v => v.Name == "Manager"), Is.True, "Manager class found");
+
+        var protocols = translationUnit.TranslationUnitDecl.Decls.OfType<ObjCProtocolDecl>().ToList();
+        Assert.That(protocols.Any(v => v.Name == "DelegateProtocol"), Is.True, "DelegateProtocol found");
+
+        var categories = translationUnit.TranslationUnitDecl.Decls.OfType<ObjCCategoryDecl>().ToList();
+        Assert.That(categories.Count, Is.GreaterThanOrEqualTo(2), "At least 2 categories");
+    }
+
+    private static string? GetMacOSSdkPath() => GetSdkPath("macosx");
+
+    private static string? GetIPhoneOSSdkPath() => GetSdkPath("iphoneos");
+
+    /// <summary>
+    /// Create a TranslationUnit that imports Foundation, trying available SDKs.
+    /// Returns null if no SDK can successfully compile the input.
+    /// </summary>
+    private static TranslationUnit? CreateFoundationTranslationUnit(string sourceFile, string[] sdksToTry)
+    {
+        var clangResourceDir = GetClangResourceDir();
+
+        foreach (var sdk in sdksToTry)
+        {
+            var sdkPath = GetSdkPath(sdk);
+            if (string.IsNullOrEmpty(sdkPath))
+            {
+                continue;
+            }
+
+            var index = CXIndex.Create();
+            var args = new List<string> { "-isysroot", sdkPath, "-xobjective-c", "-fobjc-arc" };
+            if (!string.IsNullOrEmpty(clangResourceDir))
+            {
+                args.AddRange(["-resource-dir", clangResourceDir]);
+            }
+
+            var errorCode = CXTranslationUnit.TryParse(index, sourceFile, args.ToArray(), [], DefaultTranslationUnitFlags, out var handle);
+
+            if (errorCode != CXErrorCode.CXError_Success)
+            {
+                continue;
+            }
+
+            var tu = TranslationUnit.GetOrCreate(handle);
+
+            // Check for fatal compilation errors (e.g. missing headers)
+            var hasFatalErrors = false;
+            for (uint i = 0; i < tu.Handle.NumDiagnostics; i++)
+            {
+                using var diag = tu.Handle.GetDiagnostic(i);
+                if (diag.Severity >= CXDiagnosticSeverity.CXDiagnostic_Fatal)
+                {
+                    hasFatalErrors = true;
+                    break;
+                }
+            }
+
+            if (!hasFatalErrors)
+            {
+                return tu;
+            }
+
+            tu.Dispose();
+        }
+
+        return null;
+    }
+
+    private static string? GetClangResourceDir()
+    {
+        try
+        {
+            var psi = new System.Diagnostics.ProcessStartInfo
+            {
+                FileName = "xcrun",
+                ArgumentList = { "clang", "--print-resource-dir" },
+                RedirectStandardOutput = true,
+                UseShellExecute = false,
+            };
+            using var process = System.Diagnostics.Process.Start(psi);
+            var output = process?.StandardOutput.ReadToEnd().Trim();
+            process?.WaitForExit();
+            if (process?.ExitCode == 0 && !string.IsNullOrEmpty(output) && Directory.Exists(output))
+            {
+                return output;
+            }
+        }
+        catch (InvalidOperationException)
+        {
+            // xcrun not available
+        }
+
+        return null;
+    }
+
+    private static string? GetSdkPath(string sdk)
+    {
+        try
+        {
+            var psi = new System.Diagnostics.ProcessStartInfo
+            {
+                FileName = "xcrun",
+                ArgumentList = { "--show-sdk-path", "--sdk", sdk },
+                RedirectStandardOutput = true,
+                UseShellExecute = false,
+            };
+            using var process = System.Diagnostics.Process.Start(psi);
+            var output = process?.StandardOutput.ReadToEnd().Trim();
+            process?.WaitForExit();
+            if (process?.ExitCode == 0 && !string.IsNullOrEmpty(output) && Directory.Exists(output))
+            {
+                return output;
+            }
+        }
+        catch (InvalidOperationException)
+        {
+            // xcrun not available
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// Recursively visit a declaration's type information, including parameter types,
+    /// return types, and property types. This exercises the ClangSharp type creation
+    /// path that can crash with ArgumentOutOfRangeException("handle") when a type's
+    /// CXTypeKind doesn't match what ClangSharp expects for its CX_TypeClass.
+    /// </summary>
+    private static void VisitDeclTypes(Decl decl)
+    {
+        if (decl is ObjCMethodDecl methodDecl)
+        {
+            _ = methodDecl.ReturnType;
+            foreach (var param in methodDecl.Parameters)
+            {
+                WalkType(param.Type);
+            }
+        }
+        else if (decl is ObjCPropertyDecl propertyDecl)
+        {
+            WalkType(propertyDecl.Type);
+        }
+        else if (decl is FieldDecl fieldDecl)
+        {
+            WalkType(fieldDecl.Type);
+        }
+        else if (decl is VarDecl varDecl)
+        {
+            WalkType(varDecl.Type);
+        }
+    }
+
+    /// <summary>
+    /// Walk a type's structure to force ClangSharp to materialize related types.
+    /// This triggers PointeeType, ModifiedType, etc. which are lazily evaluated
+    /// and can crash if CXTypeKind doesn't match the expected kind.
+    /// </summary>
+    private static void WalkType(Type type)
+    {
+        if (type is PointerType pointerType)
+        {
+            _ = pointerType.PointeeType;
+        }
+        else if (type is AttributedType attributedType)
+        {
+            _ = attributedType.ModifiedType;
+            _ = attributedType.EquivalentType;
+        }
+        else if (type is ObjCObjectPointerType objcPointerType)
+        {
+            _ = objcPointerType.PointeeType;
+        }
     }
 }
