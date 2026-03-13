@@ -20,19 +20,29 @@ public unsafe class Type : IEquatable<Type>
 
     protected Type(CXType handle, CXTypeKind expectedKind, CX_TypeClass expectedTypeClass, params ReadOnlySpan<CXTypeKind> additionalExpectedKinds)
     {
-#if NET10_0_OR_GREATER
-        if (handle.kind != expectedKind && !additionalExpectedKinds.Contains(handle.kind))
-#else
-        if (handle.kind != expectedKind && !Contains(additionalExpectedKinds, handle.kind))
-#endif
-        {
-            throw new ArgumentOutOfRangeException(nameof(handle));
-        }
-
         if ((handle.TypeClass == CX_TypeClass_Invalid) || (handle.TypeClass != expectedTypeClass))
         {
             throw new ArgumentOutOfRangeException(nameof(handle));
         }
+
+        // CXTypeKind is validated after TypeClass because libclang's CXTypeKind uses a
+        // coarser classification than libClangSharp's CX_TypeClass. For example, libclang
+        // may return CXType_ObjCId or CXType_Unexposed for a type that libClangSharp
+        // correctly classifies as CX_TypeClass_Attributed via the Clang AST. Since
+        // TypeClass is the authoritative classifier and already validated above, a
+        // CXTypeKind mismatch is not fatal.
+        var kindMatches = handle.kind == expectedKind
+#if NET10_0_OR_GREATER
+            || additionalExpectedKinds.Contains(handle.kind);
+#else
+            || Contains(additionalExpectedKinds, handle.kind);
+#endif
+
+        if (!kindMatches)
+        {
+            Debug.WriteLine($"Unexpected CXTypeKind for {handle.TypeClass}: {handle.kind}.");
+        }
+
         Handle = handle;
 
         _asString = new ValueLazy<string>(Handle.Spelling.ToString);

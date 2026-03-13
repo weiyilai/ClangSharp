@@ -26,7 +26,12 @@ public class Decl : Cursor
 
     private protected Decl(CXCursor handle, CXCursorKind expectedCursorKind, CX_DeclKind expectedDeclKind) : base(handle, expectedCursorKind)
     {
-        if ((handle.DeclKind == CX_DeclKind_Invalid) || (handle.DeclKind != expectedDeclKind))
+        // When the native libClangSharp doesn't have a mapping for a declaration kind,
+        // it returns CX_DeclKind_Invalid. When the default case in Decl.Create() constructs
+        // a generic Decl with expectedDeclKind == CX_DeclKind_Invalid, we should allow it
+        // rather than throwing, so that unknown declaration kinds degrade gracefully to a
+        // base Decl wrapper instead of crashing the entire traversal.
+        if (handle.DeclKind != expectedDeclKind)
         {
             throw new ArgumentOutOfRangeException(nameof(handle));
         }
